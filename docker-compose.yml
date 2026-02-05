@@ -23,5 +23,201 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Init container to process nginx configuration
+  nginx_config_init:
+    image: nginx:latest
+    configs:
+      - source: nginx_config
+        target: /tmp/nginx.conf.template
+    environment:
+      - HOSTNAME=${HOSTNAME}
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - nginx_processed_config:/etc/nginx/conf.d
+    command: |
+      sh -c "
+        echo 'Processing nginx configuration...'
+        
+        # Replace placeholders with actual values
+        SERVER_NAME=\"$${HOSTNAME}.$${DOMAIN}\"
+        CERT_FILENAME=\"$${HOSTNAME}.$${DOMAIN}.crt\"
+        KEY_FILENAME=\"$${HOSTNAME}.$${DOMAIN}.key\"
+        
+        echo \"Configuring for: $$SERVER_NAME\"
+        echo \"Certificate: $$CERT_FILENAME\"
+        echo \"Key: $$KEY_FILENAME\"
+        
+        # Process template and save to volume
+        sed \"s|PLACEHOLDER_SERVER_NAME|$$SERVER_NAME|g; s|PLACEHOLDER_CERT_FILENAME|$$CERT_FILENAME|g; s|PLACEHOLDER_KEY_FILENAME|$$KEY_FILENAME|g\" /tmp/nginx.conf.template > /etc/nginx/conf.d/default.conf
+        
+        echo 'Configuration processed successfully'
+        echo 'Final config:'
+        cat /etc/nginx/conf.d/default.conf | head -10
+      "
+    restart: "no"
+
+  nginx_proxy:
+    image: nginx:latest
+    ports:
+      - 8888:80    # HTTP port for redirection to HTTPS
+      - 8884:443   # HTTPS port for SSL termination
+    volumes:
+      # read only access to the SSL certs and keys
+      - ${SSL_CERTS_DIR}:/etc/nginx/certs:ro
+      - ${SSL_KEY_DIR}:/etc/nginx/private:ro
+      - nginx_html:/usr/share/nginx/html
+      # Processed configuration from init container
+      - nginx_processed_config:/etc/nginx/conf.d
+    depends_on:
+      nginx_config_init:
+        condition: service_completed_successfully
+      clipcascade:
+        condition: service_started
+    restart: always
+
 volumes:
   data:
+  nginx_html:
+  nginx_processed_config:
+
+configs:
+  nginx_config:
+    content: |
+      # HTTP to HTTPS redirect
+      server {
+          listen 80;
+          server_name PLACEHOLDER_SERVER_NAME;
+          return 301 https://$$host:8884$$request_uri;
+      }
+
+      # HTTPS server with SSL termination and reverse proxy
+      server {
+          listen 443 ssl;
+          # http2 on;
+          server_name PLACEHOLDER_SERVER_NAME;
+
+          # Gzip compression
+          gzip on;
+          gzip_vary on;
+          gzip_min_length 1024;
+          gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
+
+          # SSL Certificate Configuration
+          ssl_certificate /etc/nginx/certs/PLACEHOLDER_CERT_FILENAME;
+          ssl_certificate_key /etc/nginx/private/PLACEHOLDER_KEY_FILENAME;
+
+          # SSL Security Settings
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+          ssl_prefer_server_ciphers off;
+          ssl_session_cache shared:SSL:10m;
+          ssl_session_timeout 10m;
+
+          # Security Headers
+          add_header Strict-Transport-Security "max-age=63072000" always;
+          add_header X-Frame-Options DENY always;
+          add_header X-Content-Type-Options nosniff always;
+          add_header X-XSS-Protection "1; mode=block" always;
+          add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+          location / {
+              proxy_set_header Host $$http_host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto https;
+              proxy_set_header X-Forwarded-Host $$http_host;
+              proxy_set_header X-Forwarded-Port 8884;
+              proxy_set_header X-Forwarded-Ssl on;
+              proxy_set_header X-Url-Scheme https;
+              proxy_set_header X-NginX-Proxy true;
+
+              # This is necessary to pass the correct IP to be hashed
+              real_ip_header X-Real-IP;
+
+              # Rewrite all http Location headers to https
+              proxy_redirect http://$$host:8884/ https://$$host:8884/;
+
+              proxy_pass http://clipcascade:8080;
+          }
+
+          # Dedicated WebSocket endpoint for ClipCascade
+          location /clipsocket {
+              proxy_set_header Host $$http_host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto https;
+              proxy_set_header X-Forwarded-Host $$http_host;
+              proxy_set_header X-Forwarded-Port 8884;
+              proxy_set_header X-Forwarded-Ssl on;
+              proxy_set_header X-Url-Scheme https;
+              proxy_set_header X-NginX-Proxy true;
+
+              # This is necessary to pass the correct IP to be hashed
+              real_ip_header X-Real-IP;
+
+              proxy_connect_timeout 300;
+
+              # To support websockets
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $$http_upgrade;
+              proxy_set_header Connection "upgrade";
+
+              proxy_set_header Origin '';
+
+              # Rewrite all http Location headers to https
+              proxy_redirect http://$$host:8884/ https://$$host:8884/;
+
+              proxy_pass http://clipcascade:8080/clipsocket;
+          }
+
+          location /p2psignaling {
+              proxy_set_header Host $$http_host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto https;
+              proxy_set_header X-Forwarded-Host $$http_host;
+              proxy_set_header X-Forwarded-Port 8884;
+              proxy_set_header X-Forwarded-Ssl on;
+              proxy_set_header X-Url-Scheme https;
+              proxy_set_header X-NginX-Proxy true;
+
+              # This is necessary to pass the correct IP to be hashed
+              real_ip_header X-Real-IP;
+
+              proxy_connect_timeout 300;
+
+              # To support websockets
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $$http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Origin '';
+
+              proxy_redirect http://$$host:8884/ https://$$host:8884/;
+
+              proxy_pass http://clipcascade:8080/p2psignaling;
+          }
+
+          # Health check endpoint
+          location /health {
+              proxy_set_header Host $$http_host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto https;
+              proxy_set_header X-Forwarded-Ssl on;
+              proxy_set_header X-Forwarded-Port 8884;
+
+              # This is necessary to pass the correct IP to be hashed
+              real_ip_header X-Real-IP;
+
+              proxy_redirect http://$$host:8884/ https://$$host:8884/;
+
+              proxy_pass http://clipcascade:8080/health;
+          }
+
+          # Optional: Custom error pages
+          error_page 500 502 503 504 /50x.html;
+          location = /50x.html {
+              root /usr/share/nginx/html;
+          }
+      }
